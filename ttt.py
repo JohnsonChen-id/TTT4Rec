@@ -134,6 +134,14 @@ class TTTConfig(PretrainedConfig):
         scan_checkpoint_group_size (`int`, *optional*, defaults to 0):
             gradient checkpoint group size on seq dimension, 0 means no checkpointing.
             In JAX implementation, we set it 4, which means we group 4 mini-batches together in 1 gradient checkpointg to save memory.
+        use_eta (`bool`, *optional*, defaults to `False`): whether to use ETA (Efficient Test-Time Adaptation).
+            ETA is ONLY applied during evaluation (predict/full_sort_predict), not during training.
+        e_margin (`float`, *optional*, defaults to `None`): entropy threshold for filtering unreliable samples.
+            If None, auto-set to 60% quantile of first test batch entropy (percentile-based, not theoretical max)
+        d_margin (`float`, *optional*, defaults to `0.3`): max frequency for redundancy filtering.
+            Items predicted more than this fraction of recent predictions are filtered (0.3 = 30%)
+        eta_top_k (`int`, *optional*, defaults to `10`): number of top items to consider for top-k metrics
+        eta_use_topk (`bool`, *optional*, defaults to `True`): whether to use top-k metrics (recommended for sparse distributions)
 
 
     ```python
@@ -177,6 +185,11 @@ class TTTConfig(PretrainedConfig):
         pre_conv=False,
         conv_kernel=4,
         scan_checkpoint_group_size=0,
+        use_eta=False,
+        e_margin=None,
+        d_margin=0.3,
+        eta_top_k=10,
+        eta_use_topk=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -202,6 +215,13 @@ class TTTConfig(PretrainedConfig):
         self.pre_conv = pre_conv
         self.conv_kernel = conv_kernel
         self.scan_checkpoint_group_size = scan_checkpoint_group_size
+        
+        # ETA parameters
+        self.use_eta = use_eta
+        self.e_margin = e_margin
+        self.d_margin = d_margin
+        self.eta_top_k = eta_top_k
+        self.eta_use_topk = eta_use_topk
 
         super().__init__(
             pad_token_id=pad_token_id,
