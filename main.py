@@ -39,7 +39,7 @@ from recbole.data.dataset import SequentialDataset
 from recbole.model.loss import BPRLoss
 
 from ttt import TTTModel, TTTConfig
-from eta_utils import filter_samples_eta, update_recent_items, compute_eta_loss_coefficients, topk_entropy, softmax_entropy
+from eta_utils import filter_samples_eta, update_recent_items, update_model_probs, compute_eta_loss_coefficients, topk_entropy, softmax_entropy
 
 
 class CustomSequentialDataset(SequentialDataset):
@@ -83,16 +83,24 @@ class TTT4Rec(SequentialRecommender):
 
         # ETA parameters
         self.use_eta = ttt_config.use_eta
+        # Flag to disable TTT adaptation (for testing saved models without adaptation)
+        self.disable_ttt_adaptation = getattr(ttt_config, 'disable_ttt_adaptation', False)
         if self.use_eta:
             # e_margin will be set from first test batch (percentile-based)
             # If manually specified, use that value
             self.e_margin = ttt_config.e_margin  # None = auto from first test batch
-            self.max_frequency = ttt_config.d_margin  # Reuse d_margin as max_frequency (0.3 = 30%)
+            self.redundancy_threshold = ttt_config.d_margin  # For frequency: max_frequency, for cosine: similarity threshold
+            self.redundancy_filter_type = ttt_config.redundancy_filter_type  # 'frequency' or 'cosine'
             self.eta_top_k = ttt_config.eta_top_k
             self.eta_use_topk = ttt_config.eta_use_topk
             # ETA is ONLY applied during evaluation (predict/full_sort_predict)
-            # Recent items history for redundancy filtering
-            self.recent_items = None
+            # Redundancy filtering data: depends on filter type
+            if self.redundancy_filter_type == 'frequency':
+                self.recent_items = None  # For frequency-based filtering
+                self.current_model_probs = None
+            else:  # cosine
+                self.recent_items = None
+                self.current_model_probs = None  # Moving average of model probabilities
             # Flag to track if e_margin has been calibrated from first test batch
             self.e_margin_calibrated = False
             # Statistics
@@ -140,6 +148,9 @@ class TTT4Rec(SequentialRecommender):
             self.num_samples_total = 0
             self.num_samples_update_1 = 0
             self.num_samples_update_2 = 0
+            self.e_margin_calibrated = False
+            self.recent_items = None
+            self.current_model_probs = None
     
     def _init_eta_optimizer(self):
         """Initialize ETA optimizer for test-time adaptation on TTT layer parameters."""
@@ -230,7 +241,7 @@ class TTT4Rec(SequentialRecommender):
         
         # Use 60% quantile (or mean) as threshold
         # This calibrates to actual operating range rather than theoretical max
-        e_margin_candidate = torch.quantile(entropys, 0.6).item()
+        e_margin_candidate = torch.quantile(entropys, 0.4).item()
         # Alternative: use mean
         # e_margin_candidate = entropys.mean().item()
         
@@ -289,12 +300,19 @@ class TTT4Rec(SequentialRecommender):
             batch_size = logits.size(0)
             self.num_samples_total += batch_size
             
+            # Prepare redundancy data based on filter type
+            if self.redundancy_filter_type == 'frequency':
+                redundancy_data = self.recent_items
+            else:  # cosine
+                redundancy_data = self.current_model_probs
+            
             # Apply ETA filtering
-            filter_ids_1, filter_ids_2, entropys, predicted_items = filter_samples_eta(
+            filter_ids_1, filter_ids_2, entropys, redundancy_output = filter_samples_eta(
                 logits,
-                self.recent_items,
+                redundancy_data,
                 self.e_margin,
-                self.max_frequency,
+                self.redundancy_threshold,
+                redundancy_filter_type=self.redundancy_filter_type,
                 use_topk=self.eta_use_topk and logits.size(1) > self.eta_top_k,
                 top_k=self.eta_top_k,
                 min_samples_ratio=0.1
@@ -304,15 +322,28 @@ class TTT4Rec(SequentialRecommender):
             self.num_samples_update_1 += filter_ids_1.size(0)
             self.num_samples_update_2 += filter_ids_2.size(0)
             
-            # Update recent items history
-            self.recent_items = update_recent_items(
-                self.recent_items, 
-                predicted_items,
-                max_history=100
-            )
+            # Update redundancy filtering data based on filter type
+            if self.redundancy_filter_type == 'frequency':
+                # For frequency mode: update recent items history
+                predicted_items = logits.argmax(dim=1)  # Get predicted items
+                self.recent_items = update_recent_items(
+                    self.recent_items, 
+                    predicted_items,
+                    max_history=100
+                )
+            else:  # cosine
+                # For cosine mode: update moving average of probabilities
+                probs = logits.softmax(1)  # [batch_size, num_items]
+                self.current_model_probs = update_model_probs(
+                    self.current_model_probs,
+                    probs,
+                    top_k=self.eta_top_k,
+                    alpha=0.1
+                )
             
             # ETA ADAPTATION: Use filtered samples to adapt model
-            if filter_ids_2.size(0) > 0 and self.eta_optimizer is not None:
+            # Skip adaptation if disabled (for testing saved models without adaptation)
+            if filter_ids_2.size(0) > 0 and self.eta_optimizer is not None and not self.disable_ttt_adaptation:
                 # Get filtered samples
                 item_seq_filtered = item_seq[filter_ids_2]
                 item_seq_len_filtered = item_seq_len[filter_ids_2]
@@ -377,9 +408,10 @@ ttt_config = TTTConfig(
         pre_conv=False,
         share_qk=False,
         use_eta=True,
-        e_margin=None,  # Auto: 60% quantile of first test batch entropy (percentile-based)
-        d_margin=0.3,  # Max frequency for redundancy filtering (0.3 = 30% of recent predictions)
-        eta_top_k=10,  # Number of top items for top-k metrics (recommended for sparse distributions)
+        e_margin=None,
+        redundancy_filter_type='cosine',
+        d_margin=0.3,
+        eta_top_k=50,  # Number of top items for top-k metrics (recommended for sparse distributions)
         eta_use_topk=True)  # Use top-k metrics (recommended for recommendation systems with >99% sparsity)
 
 rec_config = Config(model=TTT4Rec, config_file_list=['config.yaml'])
@@ -401,14 +433,14 @@ init_seed(rec_config['seed'], rec_config['reproducibility'])
 # logger initialization
 init_logger(rec_config)
 logger = getLogger()
-logger.setLevel(logging.INFO)
-logger.info(sys.argv)
-logger.info(rec_config)
+# logger.setLevel(logging.INFO)
+# logger.info(sys.argv)
+# logger.info(rec_config)
 
 # dataset filtering
 # dataset = create_dataset(rec_config)
 dataset = CustomSequentialDataset(rec_config)
-logger.info(dataset)
+# logger.info(dataset)
 
 # dataset splitting
 train_data, valid_data, test_data = data_preparation(rec_config, dataset)
@@ -427,7 +459,7 @@ logger.info(model)
 if model.use_eta:
     e_margin_str = "auto (from first test batch)" if model.e_margin is None else f"{model.e_margin:.4f}"
     logger.info(set_color("ETA enabled", "green") + 
-                f": e_margin={e_margin_str}, max_frequency={model.max_frequency:.2f}, "
+                f": e_margin={e_margin_str}, redundancy_threshold={model.redundancy_threshold:.2f}, "
                 f"top_k={model.eta_top_k}, use_topk={model.eta_use_topk}")
 else:
     logger.info(set_color("ETA disabled", "yellow") + " (using all samples)")
@@ -460,7 +492,7 @@ if model.use_eta:
     # Reset statistics for test phase
     model.reset_eta_statistics()
     model.e_margin_calibrated = False  # Recalibrate on test set
-    model.recent_items = None  # Reset recent items history
+    # Reset redundancy filtering data (handled by reset_eta_statistics)
 
 # model evaluation
 test_result = trainer.evaluate(
@@ -480,11 +512,11 @@ if model.use_eta:
         logger.info(f"  Total filtered: {eta_stats['filtered_total']:,} ({eta_stats['pct_filtered']:.2f}%)")
         logger.info(f"  → Model adapted on {eta_stats['pct_final']:.2f}% of samples ({eta_stats['reliable_and_non_redundant']:,}/{eta_stats['total_samples']:,})")
 
-environment_tb = get_environment(rec_config)
-logger.info(
-    "The running environment of this training is as follows:\n"
-    + environment_tb.draw()
-)
+# environment_tb = get_environment(rec_config)
+# logger.info(
+#     "The running environment of this training is as follows:\n"
+#     + environment_tb.draw()
+# )
 
 logger.info(set_color("best valid ", "yellow") + f": {best_valid_result}")
 logger.info(set_color("test result", "yellow") + f": {test_result}")

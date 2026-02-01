@@ -138,8 +138,12 @@ class TTTConfig(PretrainedConfig):
             ETA is ONLY applied during evaluation (predict/full_sort_predict), not during training.
         e_margin (`float`, *optional*, defaults to `None`): entropy threshold for filtering unreliable samples.
             If None, auto-set to 60% quantile of first test batch entropy (percentile-based, not theoretical max)
-        d_margin (`float`, *optional*, defaults to `0.3`): max frequency for redundancy filtering.
-            Items predicted more than this fraction of recent predictions are filtered (0.3 = 30%)
+        d_margin (`float`, *optional*, defaults to `0.3`): redundancy threshold.
+            For 'frequency' mode: max frequency for redundancy filtering (items predicted more than this fraction of recent predictions are filtered, 0.3 = 30%).
+            For 'cosine' mode: cosine similarity threshold (samples with similarity above this are filtered, default: 0.5).
+        redundancy_filter_type (`str`, *optional*, defaults to `'frequency'`): type of redundancy filtering.
+            'frequency': Check if predicted item IDs have been predicted too frequently recently (Jaccard-ish overlap).
+            'cosine': Use top-k cosine similarity between current predictions and moving average of model probabilities.
         eta_top_k (`int`, *optional*, defaults to `10`): number of top items to consider for top-k metrics
         eta_use_topk (`bool`, *optional*, defaults to `True`): whether to use top-k metrics (recommended for sparse distributions)
 
@@ -188,6 +192,7 @@ class TTTConfig(PretrainedConfig):
         use_eta=False,
         e_margin=None,
         d_margin=0.3,
+        redundancy_filter_type='frequency',
         eta_top_k=10,
         eta_use_topk=True,
         **kwargs,
@@ -220,6 +225,7 @@ class TTTConfig(PretrainedConfig):
         self.use_eta = use_eta
         self.e_margin = e_margin
         self.d_margin = d_margin
+        self.redundancy_filter_type = redundancy_filter_type
         self.eta_top_k = eta_top_k
         self.eta_use_topk = eta_use_topk
 
