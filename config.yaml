@@ -1,4 +1,6 @@
-gpu_id: '0'
+# Device settings - use CPU (empty gpu_id forces CPU mode)
+gpu_id: ''      # Empty string forces CPU mode (no GPU)
+use_gpu: False  # Explicitly disable GPU
 log_wandb: False
 
 hidden_size: 64                 # (int) Number of features in the hidden state. 
